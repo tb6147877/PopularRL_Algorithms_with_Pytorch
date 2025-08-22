@@ -6,7 +6,7 @@ import torch.optim as optim
 from typing import Dict, List, Tuple
 from IPython.display import clear_output
 import matplotlib.pyplot as plt
-import os
+
 import gymnasium as gym
 
 import sys
@@ -193,7 +193,9 @@ class DQNAgent:
 
         curr_q_value = self.dqn(state).gather(1, action)
 
-        next_q_value = self.dqn_target(next_state).max(dim=1,keepdim=True)[0].detach()
+        next_q_value = self.dqn_target(next_state).gather(  # Double DQN
+            1, self.dqn(next_state).argmax(dim=1, keepdim=True)
+        ).detach()
         mask=1-done
         target = (reward + self.gamma * next_q_value*mask).to(device)
         loss = F.smooth_l1_loss(curr_q_value, target)
@@ -256,7 +258,7 @@ agent = DQNAgent(env,memory_size,batch_size,target_update,epsilon_decay,seed)
 
 agent.train(num_frames)
 
-video_folder="videos/dqn"
+video_folder="videos/dqn_double"
 agent.test(video_folder)
 
 
