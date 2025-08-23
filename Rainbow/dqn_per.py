@@ -139,12 +139,11 @@ class Network(nn.Module):
 
 
 class DQNAgent:
-    def __init__(self, env:gym.Env, memory_size:int, batch_size:int, target_update:int, epsilon_decay:float, seed:int, max_epsilon:float=1.0, min_epsilon:float=0.1,gamma:float=0.99):
+    def __init__(self, env:gym.Env, memory_size:int, batch_size:int, target_update:int, epsilon_decay:float, seed:int, max_epsilon:float=1.0, min_epsilon:float=0.1,gamma:float=0.99,alpha:float=0.2,beta:float=0.6,prior_eps:float=1e-6):
         obs_dim = env.observation_space.shape[0]
         action_dim = env.action_space.n
 
         self.env = env
-        self.memory = ReplayBuffer(obs_dim, memory_size, batch_size)
         self.batch_size = batch_size
         self.epsilon = max_epsilon
         self.epsilon_decay = epsilon_decay
@@ -156,6 +155,11 @@ class DQNAgent:
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(self.device)
+
+        # per
+        self.beta=beta
+        self.prior_eps=prior_eps
+        self.memory = PrioritizedReplayBuffer(obs_dim,memory_size,batch_size,alpha)
 
         self.dqn = Network(obs_dim, action_dim).to(self.device)
         self.dqn_target = Network(obs_dim, action_dim).to(self.device)
@@ -191,11 +195,21 @@ class DQNAgent:
         return next_state, reward, done
 
     def update_model(self)->torch.Tensor:
-        samples = self.memory.sample_batch()
-        loss = self._compute_dqn_loss(samples)
+        #per
+        samples = self.memory.sample_batch(self.beta)
+        weights = torch.FloatTensor(samples["weights"].reshape(-1,1)).to(self.device)
+        indices = samples["indices"]
+
+        elementwise_loss = self._compute_dqn_loss(samples)
+        loss = torch.mean(elementwise_loss*weights)
+
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
+
+        loss_for_prior = elementwise_loss.detach().cpu().numpy()
+        new_priorities = loss_for_prior+self.prior_eps
+        self.memory.update_priorities(indices,new_priorities)
         return loss.item()
 
     def train(self,num_frames:int, plotting_interval:int=200):
@@ -213,6 +227,10 @@ class DQNAgent:
 
             state = next_state
             score += reward
+
+            #per
+            fraction = min(frame_idx/num_frames,1.0)
+            self.beta=self.beta+fraction*(1.0-self.beta)
 
             if done:
                 state,_ = self.env.reset(seed=self.seed)
@@ -273,9 +291,11 @@ class DQNAgent:
         next_q_value = self.dqn_target(next_state).max(dim=1,keepdim=True)[0].detach()
         mask=1-done
         target = (reward + self.gamma * next_q_value*mask).to(device)
-        loss = F.smooth_l1_loss(curr_q_value, target)
 
-        return loss
+        #per
+        elementwise_loss = F.smooth_l1_loss(curr_q_value, target,reduction="none")
+
+        return elementwise_loss
 
     def _target_hard_update(self):
         self.dqn_target.load_state_dict(self.dqn.state_dict())
