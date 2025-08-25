@@ -59,6 +59,9 @@ class NoisyLinear(nn.Module):
         self.bias_sigma = nn.Parameter(torch.Tensor(out_features))
         self.register_buffer("bias_epsilon", torch.Tensor(out_features))
 
+        self.reset_parameters()
+        self.reset_noise()
+
     def reset_parameters(self):
         mu_range=1/math.sqrt(self.in_features)
         self.weight_mu.data.uniform_(-mu_range,mu_range)
@@ -67,37 +70,51 @@ class NoisyLinear(nn.Module):
         self.bias_mu.data.uniform_(-mu_range, mu_range)
         self.bias_sigma.data.fill_(self.std_init / math.sqrt(self.out_features))
 
+    def reset_noise(self):
+        epsilon_in = self.scale_noise(self.in_features)
+        epsilon_out = self.scale_noise(self.out_features)
 
+        self.weight_epsilon.copy_(epsilon_out.ger(epsilon_in))
+        self.bias_epsilon.copy_(epsilon_out)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.linear(x,self.weight_mu+self.weight_sigma*self.weight_epsilon,self.bias_mu+self.bias_sigma*self.bias_epsilon)
+
+    @staticmethod
+    def scale_noise(size:int)->torch.Tensor:
+        x = torch.randn(size)
+
+        return x.sign().mul(x.abs().sqrt())
 
 class Network(nn.Module):
-    def __init__(self, in_dim:int, out_dim:int):
+    def __init__(self,in_dim:int, out_dim:int):
         super(Network, self).__init__()
+        self.feature = nn.Linear(in_dim, 128)
+        self.noisy_layer1 = NoisyLinear(128, 128)
+        self.noisy_layer2 = NoisyLinear(128, out_dim)
 
-        self.layers = nn.Sequential(
-            nn.Linear(in_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, 128),
-            nn.ReLU(),
-            nn.Linear(128, out_dim)
-        )
+    def forward(self,x:torch.Tensor) -> torch.Tensor:
+        feature = F.relu(self.feature(x))
+        hidden  = F.relu(self.noisy_layer1(feature))
+        out = self.noisy_layer2(hidden)
 
-    def forward(self, x:torch.Tensor) -> torch.Tensor:
-        return self.layers(x)
+        return out
+
+    def reset_noise(self):
+        self.noisy_layer1.reset_noise()
+        self.noisy_layer2.reset_noise()
+
 
 
 class DQNAgent:
-    def __init__(self, env:gym.Env, memory_size:int, batch_size:int, target_update:int, epsilon_decay:float, seed:int, max_epsilon:float=1.0, min_epsilon:float=0.1,gamma:float=0.99):
+    def __init__(self, env:gym.Env, memory_size:int, batch_size:int, target_update:int, seed:int, gamma:float=0.99):
         obs_dim = env.observation_space.shape[0]
         action_dim = env.action_space.n
 
         self.env = env
         self.memory = ReplayBuffer(obs_dim, memory_size, batch_size)
         self.batch_size = batch_size
-        self.epsilon = max_epsilon
-        self.epsilon_decay = epsilon_decay
         self.seed = seed
-        self.max_epsilon = max_epsilon
-        self.min_epsilon = min_epsilon
         self.target_update = target_update
         self.gamma = gamma
 
@@ -116,11 +133,9 @@ class DQNAgent:
         self.is_test=False
 
     def select_action(self, state:np.ndarray) -> np.ndarray:
-        if self.epsilon > np.random.random():
-            selected_action = self.env.action_space.sample()
-        else:
-            selected_action = self.dqn(torch.FloatTensor(state).to(self.device)).argmax()
-            selected_action = selected_action.detach().cpu().numpy()
+
+        selected_action = self.dqn(torch.FloatTensor(state).to(self.device)).argmax()
+        selected_action = selected_action.detach().cpu().numpy()
 
         if not self.is_test:
             self.transition= [state, selected_action]
@@ -143,13 +158,15 @@ class DQNAgent:
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
+
+        self.dqn.reset_noise()
+        self.dqn_target.reset_noise()
         return loss.item()
 
     def train(self,num_frames:int, plotting_interval:int=200):
         self.is_test=False
         state, _ = self.env.reset(seed=self.seed)
         update_cnt=0
-        epsilons=[]
         losses=[]
         scores=[]
         score=0
@@ -171,14 +188,11 @@ class DQNAgent:
                 losses.append(loss)
                 update_cnt += 1
 
-                self.epsilon =max(self.min_epsilon,self.epsilon-(self.max_epsilon-self.min_epsilon)*self.epsilon_decay)
-                epsilons.append(self.epsilon)
-
                 if update_cnt % self.target_update == 0:
                     self._target_hard_update()
 
             if frame_idx % plotting_interval == 0:
-                self._plot(frame_idx,scores,losses,epsilons)
+                self._plot(frame_idx,scores,losses)
         self.env.close()
 
     def test(self, video_folder:str)->None:
@@ -231,8 +245,7 @@ class DQNAgent:
             self,
             frame_idx: int,
             scores: List[float],
-            losses: List[float],
-            epsilons: List[float],
+            losses: List[float]
     ):
         """Plot the training progresses."""
         clear_output(True)
@@ -243,9 +256,6 @@ class DQNAgent:
         plt.subplot(132)
         plt.title('loss')
         plt.plot(losses)
-        plt.subplot(133)
-        plt.title('epsilons')
-        plt.plot(epsilons)
         plt.show()
 
 env = gym.make("CartPole-v1", max_episode_steps=200, render_mode='rgb_array')
@@ -274,9 +284,9 @@ num_frames=10000
 memory_size=1000
 batch_size=32
 target_update=100
-epsilon_decay=1/2000
 
-agent = DQNAgent(env,memory_size,batch_size,target_update,epsilon_decay,seed)
+
+agent = DQNAgent(env,memory_size,batch_size,target_update,seed)
 
 agent.train(num_frames)
 
