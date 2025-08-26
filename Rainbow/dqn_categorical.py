@@ -77,7 +77,7 @@ class Network(nn.Module):
 
 
 class DQNAgent:
-    def __init__(self, env:gym.Env, memory_size:int, batch_size:int, target_update:int, epsilon_decay:float, seed:int, max_epsilon:float=1.0, min_epsilon:float=0.1,gamma:float=0.99):
+    def __init__(self, env:gym.Env, memory_size:int, batch_size:int, target_update:int, epsilon_decay:float, seed:int, max_epsilon:float=1.0, min_epsilon:float=0.1,gamma:float=0.99, v_min:float=0.0, v_max:float=200.0,atom_size:int=51):
         obs_dim = env.observation_space.shape[0]
         action_dim = env.action_space.n
 
@@ -94,6 +94,11 @@ class DQNAgent:
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(self.device)
+
+        self.v_min = v_min
+        self.v_max = v_max
+        self.atom_size = atom_size
+        self.support = torch.linspace(self.v_min, self.v_max, self.atom_size).to(self.device)
 
         self.dqn = Network(obs_dim, action_dim).to(self.device)
         self.dqn_target = Network(obs_dim, action_dim).to(self.device)
@@ -206,12 +211,16 @@ class DQNAgent:
         reward = torch.FloatTensor(samples["rews"].reshape(-1,1)).to(device)
         done = torch.FloatTensor(samples["done"].reshape(-1,1)).to(device)
 
-        curr_q_value = self.dqn(state).gather(1, action)
+        delta_z = float(self.v_max - self.v_min) / (self.atom_size - 1)
 
-        next_q_value = self.dqn_target(next_state).max(dim=1,keepdim=True)[0].detach()
-        mask=1-done
-        target = (reward + self.gamma * next_q_value*mask).to(device)
-        loss = F.smooth_l1_loss(curr_q_value, target)
+        with torch.no_grad():
+            next_action = self.dqn_target(next_state).argmax(1)
+            next_dist = self.dqn_target.dist(next_state)
+            next_dist = next_dist[range(self.batch_size), next_action]
+
+            t_z = reward + self.gamma * self.support * (1 - done)
+
+
 
         return loss
 
