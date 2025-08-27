@@ -100,8 +100,8 @@ class DQNAgent:
         self.atom_size = atom_size
         self.support = torch.linspace(self.v_min, self.v_max, self.atom_size).to(self.device)
 
-        self.dqn = Network(obs_dim, action_dim).to(self.device)
-        self.dqn_target = Network(obs_dim, action_dim).to(self.device)
+        self.dqn = Network(obs_dim, action_dim,atom_size,self.support).to(self.device)
+        self.dqn_target = Network(obs_dim, action_dim,atom_size,self.support).to(self.device)
         self.dqn_target.load_state_dict(self.dqn.state_dict())
         self.dqn_target.eval()
 
@@ -219,8 +219,21 @@ class DQNAgent:
             next_dist = next_dist[range(self.batch_size), next_action]
 
             t_z = reward + self.gamma * self.support * (1 - done)
+            t_z= t_z.clamp(min=self.v_min,max = self.v_max)
+            b = (t_z-self.v_min)/delta_z
+            l = b.floor().long()
+            u = b.floor().long()+1
 
+            offset = (torch.linspace(0,(self.batch_size-1)*self.atom_size,self.batch_size).long().unsqueeze(1).expand(self.batch_size,self.atom_size).to(self.device))
 
+            proj_dist = torch.zeros(next_dist.size(),device=self.device)
+            proj_dist.view(-1).index_add_(0,(l+offset).view(-1), (next_dist*(u.float()-b)).view(-1))
+            proj_dist.view(-1).index_add_(0,(u.clamp(max=self.atom_size-1)+offset).view(-1),(next_dist*(b-l.float())).view(-1))
+
+        dist = self.dqn.dist(state)
+        log_p = torch.log(dist[range(self.batch_size),action])
+
+        loss = -(proj_dist*log_p).sum(1).mean()
 
         return loss
 
