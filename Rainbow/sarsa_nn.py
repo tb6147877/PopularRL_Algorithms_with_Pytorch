@@ -114,8 +114,9 @@ def train(args,env,agent):
         if np.random.rand() < epsilon:
             action = env.action_space.sample()
         else:
-            action = agent.get_action(torch.from_numpy(state).float().to(args.device))
-            action = action.item()
+            with torch.no_grad():
+                action = agent.get_action(torch.from_numpy(state).float().to(args.device))
+                action = action.item()
 
         next_state, reward, terminated, truncated, _ = env.step(action)
         done = terminated or truncated
@@ -175,12 +176,14 @@ def test(args, env, agent:SARSA)->None:
     done=False
     score=0
 
-    while not done:
-        action = agent.get_action(torch.from_numpy(state).float().to(args.device)).item()
-        next_state, reward, terminated,truncated,_ = env.step(action)
-        done = terminated or truncated
-        state = next_state
-        score += reward
+    with torch.no_grad():
+        while not done:
+            action = agent.get_action(torch.from_numpy(state).float().to(args.device)).item()
+            next_state, reward, terminated, truncated, _ = env.step(action)
+            done = terminated or truncated
+            state = next_state
+            score += reward
+
 
     print("score:",score)
     env.close()
