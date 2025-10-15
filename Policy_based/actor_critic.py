@@ -8,6 +8,18 @@ import gymnasium as gym
 import matplotlib.pyplot as plt
 from collections import defaultdict
 
+class ValueNet(nn.Module):
+    def __init__(self, dim_state):
+        super().__init__()
+        self.fc1 = nn.Linear(dim_state, 64)
+        self.fc2 = nn.Linear(64, 32)
+        self.fc3 = nn.Linear(32, 1)
+
+    def forward(self, state):
+        x = F.relu(self.fc1(state))
+        x = F.relu(self.fc2(x))
+        x = self.fc3(x)
+        return x
 
 
 class PolicyNet(nn.Module):
@@ -24,31 +36,37 @@ class PolicyNet(nn.Module):
         prob = F.softmax(x, dim=-1)
         return prob
 
-class REINFORCE:
+class ActorCritic:
     def __init__(self, args):
         self.args = args
+        self.V = ValueNet(args.dim_state)
+        self.V_target = ValueNet(args.dim_state)
         self.pi = PolicyNet(args.dim_state, args.num_action)
+        self.V_target.load_state_dict(self.V.state_dict())
 
     def get_action(self, state):
-        probs = self.pi(state)
-        m = Categorical(probs)
+        prob = self.pi(state)
+        m = Categorical(prob)
         action = m.sample()
-        log_prob = m.log_prob(action)
-        return action, log_prob
+        logp_action = m.log_prob(action)
+        return action, logp_action
+
+    def compute_value_loss(self, bs, blogp_a, br, bd, bns):
+        with torch.no_grad():
+            target_value = br + self.args.discount * torch.logical_not(bd) * self.V_target(bns).squeeze()
+
+        value_loss = F.mse_loss(self.V(bs).squeeze(), target_value)
+        return value_loss
 
     def compute_policy_loss(self, bs, blogp_a, br, bd, bns):
-        r_lst = []
-        R = 0
-        for i in reversed(range(len(br))):
-            R = self.args.discount * R + br[i]
-            r_lst.append(R)
-        r_lst.reverse()
-        batch_r = torch.tensor(r_lst)
+        with torch.no_grad():
+            value = self.V(bs).squeeze()
 
         policy_loss=0
         for i, logp_a in enumerate(blogp_a):
-            policy_loss+=-logp_a*batch_r[i]
+            policy_loss += -logp_a * value[i]
         policy_loss = policy_loss.mean()
+
         return policy_loss
 
     def soft_update(self, tau=0.01):
@@ -60,18 +78,18 @@ class REINFORCE:
 
 class Rollout:
     def __init__(self):
-        self.state_lst=[]
-        self.action_lst=[]
-        self.logp_action_lst=[]
-        self.rewards_lst=[]
-        self.done_lst=[]
-        self.next_state_lst=[]
+        self.state_lst = []
+        self.action_lst = []
+        self.logp_action_lst = []
+        self.reward_lst = []
+        self.done_lst = []
+        self.next_state_lst = []
 
     def put(self, state, action, logp_action, reward, done, next_state):
         self.state_lst.append(state)
         self.action_lst.append(action)
         self.logp_action_lst.append(logp_action)
-        self.rewards_lst.append(reward)
+        self.reward_lst.append(reward)
         self.done_lst.append(done)
         self.next_state_lst.append(next_state)
 
@@ -79,11 +97,10 @@ class Rollout:
         bs = torch.as_tensor(self.state_lst).float()
         ba = torch.as_tensor(self.action_lst).float()
         blogp_a = self.logp_action_lst
-        br = self.rewards_lst
+        br = torch.as_tensor(self.reward_lst).float()
         bd = torch.as_tensor(self.done_lst)
         bns = torch.as_tensor(self.next_state_lst).float()
         return bs, ba, blogp_a, br, bd, bns
-
 
 class INFO:
     def __init__(self):
@@ -109,15 +126,16 @@ class INFO:
             self.episode_length += 1
             self.episode_reward += reward
 
-def train(args, env, agent: REINFORCE):
-    pi_optimizer = torch.optim.Adam(agent.pi.parameters(), lr=args.lr)
-
+def train(args, env, agent: ActorCritic):
+    V_optimizer = torch.optim.Adam(agent.V.parameters(), lr=3e-3)
+    pi_optimizer = torch.optim.Adam(agent.pi.parameters(), lr=3e-3)
     info = INFO()
 
     rollout = Rollout()
     state, _ = env.reset()
+
     for step in range(args.max_steps):
-        action, logp_action=agent.get_action(torch.tensor(state).float())
+        action, logp_action = agent.get_action(torch.tensor(state).float())
         next_state, reward, terminated, truncated, _ = env.step(action.item())
         done = terminated or truncated
         info.put(done, reward)
@@ -128,12 +146,19 @@ def train(args, env, agent: REINFORCE):
         if done is True:
             bs, ba, blogp_a, br, bd, bns = rollout.tensor()
 
+            value_loss = agent.compute_value_loss(bs, blogp_a, br, bd, bns)
+            V_optimizer.zero_grad()
+            value_loss.backward(retain_graph=True)
+            V_optimizer.step()
+
             policy_loss = agent.compute_policy_loss(bs, blogp_a, br, bd, bns)
             pi_optimizer.zero_grad()
             policy_loss.backward()
             pi_optimizer.step()
 
-            info.log["value_loss"].append(0)
+            agent.soft_update()
+
+            info.log["value_loss"].append(value_loss.item())
             info.log["policy_loss"].append(policy_loss.item())
 
             episode_reward = info.log["episode_reward"][-1]
@@ -141,7 +166,7 @@ def train(args, env, agent: REINFORCE):
             value_loss = info.log["value_loss"][-1]
             print(f"step={step}, reward={episode_reward:.0f}, length={episode_length}, max_reward={info.max_episode_reward}, value_loss={value_loss:.1e}")
 
-            state,_ = env.reset()
+            state, _ = env.reset()
             rollout = Rollout()
 
             if episode_reward == info.max_episode_reward:
@@ -158,7 +183,7 @@ def train(args, env, agent: REINFORCE):
             plt.savefig(f"{args.output_dir}/episode_reward.png", bbox_inches="tight")
             plt.close()
 
-def test(args, env, agent:REINFORCE)->None:
+def test(args, env, agent:ActorCritic)->None:
 
     #naive_env=env
     env = gym.wrappers.RecordVideo(env,video_folder=args.output_dir)
@@ -177,8 +202,6 @@ def test(args, env, agent:REINFORCE)->None:
     print("score:",score)
     env.close()
 
-
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--env", default="CartPole-v1", type=str, help="Environment name.")
@@ -189,7 +212,7 @@ if __name__ == "__main__":
 
     parser.add_argument("--max_steps", default=100_000, type=int, help="Maximum steps for interaction.")
     parser.add_argument("--discount", default=0.99, type=float, help="Discount coefficient.")
-    parser.add_argument("--lr", default=3e-3, type=float, help="Learning rate.")
+    parser.add_argument("--lr", default=1e-3, type=float, help="Learning rate.")
     parser.add_argument("--batch_size", default=32, type=int, help="Batch size.")
     parser.add_argument("--no_cuda", action="store_true", help="Avoid using CUDA when available")
 
@@ -197,21 +220,10 @@ if __name__ == "__main__":
     parser.add_argument("--do_eval", action="store_true", help="Evaluate policy.")
     args = parser.parse_args()
 
-    env = gym.make(args.env, max_episode_steps=200,render_mode='rgb_array')
+    env = gym.make(args.env, max_episode_steps=200, render_mode='rgb_array')
 
-    agent = REINFORCE(args)
+    agent = ActorCritic(args)
 
     train(args, env, agent)
 
     test(args, env, agent)
-
-
-
-
-
-
-
-
-
-
-
